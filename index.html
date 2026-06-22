@@ -321,6 +321,19 @@
 
     .history-text p:last-child { margin-bottom: 0; }
 
+    .street-crosslink {
+      color: #6f0710;
+      font-weight: 650;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    .street-crosslink:hover,
+    .street-crosslink:focus-visible {
+      color: #4f050b;
+      outline-color: rgba(111, 7, 16, 0.35);
+    }
+
     .map-card {
       margin-top: 28px;
       border-top: 1px solid rgba(232, 225, 207, 0.9);
@@ -469,6 +482,10 @@
 
     let map;
     let activeLayer;
+    let suppressUrlUpdate = false;
+
+    const STREET_BY_NORMALISED = new Map();
+    const STREET_LINK_TARGETS = [];
 
     function normaliseName(value) {
       return String(value || "")
@@ -500,6 +517,70 @@
         .replace(/"/g, "&quot;");
     }
 
+    function escapeRegExp(value) {
+      return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+
+    function streetHref(entry) {
+      return `?street=${encodeURIComponent(displayName(entry))}`;
+    }
+
+    function updateUrlForStreet(entry, replace = false) {
+      if (suppressUrlUpdate || !entry || !window.history || !window.location) return;
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.set("street", displayName(entry));
+        const state = { street: displayName(entry) };
+        if (replace) window.history.replaceState(state, "", url);
+        else window.history.pushState(state, "", url);
+      } catch (error) {
+        // Some local-file preview modes do not allow history changes; the lookup still works.
+      }
+    }
+
+    function buildStreetIndexes() {
+      STREET_BY_NORMALISED.clear();
+      STREET_LINK_TARGETS.length = 0;
+      for (const entry of STREET_DATA) {
+        const name = displayName(entry);
+        const key = normaliseName(name);
+        if (!name || !key || STREET_BY_NORMALISED.has(key)) continue;
+        STREET_BY_NORMALISED.set(key, entry);
+        STREET_LINK_TARGETS.push({
+          entry,
+          name,
+          key,
+          pattern: escapeRegExp(name).replace(/\s+/g, "\\s+")
+        });
+      }
+      STREET_LINK_TARGETS.sort((a, b) => b.name.length - a.name.length);
+    }
+
+    function linkStreetReferences(rawParagraph, currentEntry) {
+      const paragraph = String(rawParagraph || "");
+      const currentKey = normaliseName(displayName(currentEntry));
+      const targets = STREET_LINK_TARGETS.filter(target => target.key !== currentKey);
+      if (!paragraph || !targets.length) return escapeHtml(paragraph).replace(/\n/g, "<br>");
+
+      const pattern = targets.map(target => target.pattern).join("|");
+      const streetPattern = new RegExp(`(^|[^A-Za-z0-9])(${pattern})(?=$|[^A-Za-z0-9])`, "gi");
+      let html = "";
+      let lastIndex = 0;
+      paragraph.replace(streetPattern, (match, prefix, matchedName, offset) => {
+        const start = offset + prefix.length;
+        const end = start + matchedName.length;
+        const key = normaliseName(matchedName);
+        const targetEntry = STREET_BY_NORMALISED.get(key);
+        if (!targetEntry) return match;
+        html += escapeHtml(paragraph.slice(lastIndex, start));
+        html += `<a class="street-crosslink" href="${streetHref(targetEntry)}" data-name="${escapeHtml(displayName(targetEntry))}">${escapeHtml(paragraph.slice(start, end))}</a>`;
+        lastIndex = end;
+        return match;
+      });
+      html += escapeHtml(paragraph.slice(lastIndex));
+      return html.replace(/\n/g, "<br>");
+    }
+
     function updateSignDisplay() {
       const value = searchInput.value.trim();
       signText.textContent = value || SIGN_PLACEHOLDER;
@@ -524,7 +605,7 @@
     function findExact(value) {
       const query = normaliseName(value);
       if (!query) return null;
-      return STREET_DATA.find(entry => normaliseName(displayName(entry)) === query) || null;
+      return STREET_BY_NORMALISED.get(query) || null;
     }
 
     function findSuggestions(value) {
@@ -604,11 +685,11 @@
       }
       historyText.innerHTML = text
         .split(/\n{2,}/)
-        .map(paragraph => `<p>${escapeHtml(paragraph).replace(/\n/g, "<br>")}</p>`)
+        .map(paragraph => `<p>${linkStreetReferences(paragraph, entry)}</p>`)
         .join("");
     }
 
-    function showHistory(entry) {
+    function showHistory(entry, options = {}) {
       const name = displayName(entry);
       searchInput.value = name;
       syncSign();
@@ -618,6 +699,7 @@
       emptyState.textContent = "";
       suggestions.innerHTML = "";
       showMapFor(entry);
+      if (options.updateUrl) updateUrlForStreet(entry, Boolean(options.replaceUrl));
     }
 
     function renderSuggestions(items, query) {
@@ -650,17 +732,34 @@
       const exact = findExact(value);
 
       if (exact) {
-        showHistory(exact);
+        showHistory(exact, { updateUrl: commit });
         return;
       }
 
       const matches = findSuggestions(value);
       if (commit && matches.length === 1) {
-        showHistory(matches[0]);
+        showHistory(matches[0], { updateUrl: true });
         return;
       }
 
       renderSuggestions(matches, query);
+    }
+
+    function loadStreetFromUrl(replaceUrl = false) {
+      const params = new URLSearchParams(window.location.search);
+      const requested = params.get("street") || params.get("name");
+      if (!requested) return false;
+
+      const exact = findExact(requested);
+      if (exact) {
+        showHistory(exact, { updateUrl: replaceUrl, replaceUrl: true });
+        return true;
+      }
+
+      searchInput.value = requested;
+      syncSign();
+      renderSuggestions(findSuggestions(requested), normaliseName(requested));
+      return true;
     }
 
     suggestions.addEventListener("click", event => {
@@ -671,6 +770,23 @@
       searchInput.focus();
     });
 
+    historyText.addEventListener("click", event => {
+      const link = event.target.closest("a.street-crosslink[data-name]");
+      if (!link) return;
+      const entry = findExact(link.dataset.name);
+      if (!entry) return;
+      event.preventDefault();
+      showHistory(entry, { updateUrl: true });
+      historyCard.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+
+    window.addEventListener("popstate", () => {
+      suppressUrlUpdate = true;
+      const loaded = loadStreetFromUrl(false);
+      if (!loaded) handleSearch(false);
+      suppressUrlUpdate = false;
+    });
+
     searchInput.addEventListener("input", () => handleSearch(false));
     searchInput.addEventListener("focus", syncSign);
     searchInput.addEventListener("blur", syncSign);
@@ -679,8 +795,9 @@
       handleSearch(true);
     });
 
+    buildStreetIndexes();
     syncSign();
-    handleSearch(false);
+    if (!loadStreetFromUrl(true)) handleSearch(false);
   </script>
 </body>
 </html>
